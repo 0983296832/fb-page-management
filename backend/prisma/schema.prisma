@@ -1,0 +1,217 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// Basic schema for Phase 1 & foundational entities
+model Organization {
+  id            String         @id @default(uuid())
+  name          String
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+  members       User[]
+  pages         FacebookPage[]
+  conversations Conversation[]
+  customers     Customer[]
+  tags          Tag[]
+  quickReplies  QuickReply[]
+  auditLogs     AuditLog[]
+}
+
+model User {
+  id             String       @id @default(uuid())
+  email          String       @unique
+  password       String
+  name           String?
+  role           Role         @default(AGENT)
+  organization   Organization @relation(fields: [organizationId], references: [id])
+  organizationId String
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+}
+
+enum Role {
+  OWNER
+  ADMIN
+  MANAGER
+  AGENT
+}
+
+model FacebookPage {
+  id             String       @id @default(uuid())
+  pageId         String       @unique
+  name           String
+  avatar         String?
+  accessToken    String
+  tokenExpiresAt DateTime?
+  status         PageStatus   @default(CONNECTED)
+  organization   Organization @relation(fields: [organizationId], references: [id])
+  organizationId String
+  connectedAt    DateTime?
+  lastSyncAt     DateTime?
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+}
+
+enum PageStatus {
+  CONNECTED
+  DISCONNECTED
+  ERROR
+}
+
+model Conversation {
+  id                    String             @id @default(uuid())
+  organizationId        String
+  organization          Organization       @relation(fields: [organizationId], references: [id])
+  channel               String
+  channelConversationId String
+  pageId                String?
+  assignedUserId        String?
+  status                ConversationStatus @default(OPEN)
+  unreadCount           Int                @default(0)
+  lastMessage           String?
+  lastMessageAt         DateTime?
+  createdAt             DateTime           @default(now())
+  updatedAt             DateTime           @updatedAt
+  messages              Message[]
+}
+
+model Customer {
+  id                 String             @id @default(uuid())
+  organizationId     String
+  organization       Organization       @relation(fields: [organizationId], references: [id])
+  channel            String
+  externalCustomerId String
+  name               String?
+  avatar             String?
+  phone              String?
+  email              String?
+  notes              String?
+  firstInteractionAt DateTime?
+  lastInteractionAt  DateTime?
+  createdAt          DateTime           @default(now())
+  updatedAt          DateTime           @updatedAt
+  identities         CustomerIdentity[]
+}
+
+model CustomerIdentity {
+  id         String   @id @default(uuid())
+  customerId String
+  customer   Customer @relation(fields: [customerId], references: [id])
+  provider   String
+  externalId String
+  metadata   Json?
+  createdAt  DateTime @default(now())
+}
+
+model Tag {
+  id             String       @id @default(uuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id])
+  name           String
+  color          String?
+  createdAt      DateTime     @default(now())
+}
+
+model ConversationTag {
+  id             String @id @default(uuid())
+  conversationId String
+  tagId          String
+}
+
+model CustomerTag {
+  id         String @id @default(uuid())
+  customerId String
+  tagId      String
+}
+
+model QuickReply {
+  id             String       @id @default(uuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id])
+  title          String
+  shortcut       String
+  content        String
+  createdAt      DateTime     @default(now())
+}
+
+model AuditLog {
+  id             String        @id @default(uuid())
+  organizationId String?
+  userId         String?
+  action         String
+  entity         String
+  entityId       String?
+  metadata       Json?
+  createdAt      DateTime      @default(now())
+  Organization   Organization? @relation(fields: [organizationId], references: [id])
+}
+
+enum ConversationStatus {
+  OPEN
+  PENDING
+  DONE
+}
+
+model Message {
+  id                String       @id @default(uuid())
+  organizationId    String
+  conversationId    String
+  conversation      Conversation @relation(fields: [conversationId], references: [id])
+  externalMessageId String?      @unique
+  senderType        SenderType
+  senderId          String?
+  messageType       MessageType
+  text              String?
+  metadata          Json?
+  state             MessageState @default(SENT)
+  sentAt            DateTime?
+  createdAt         DateTime     @default(now())
+}
+
+enum SenderType {
+  CUSTOMER
+  AGENT
+  PAGE
+  SYSTEM
+}
+
+enum MessageType {
+  TEXT
+  IMAGE
+  VIDEO
+  AUDIO
+  FILE
+  STICKER
+  REACTION
+  SYSTEM
+  INTERNAL_NOTE
+}
+
+enum MessageState {
+  SENDING
+  SENT
+  FAILED
+}
+
+model WebhookEvent {
+  id             String        @id @default(uuid())
+  organizationId String?
+  raw            Json
+  eventId        String?       @unique
+  status         WebhookStatus @default(RECEIVED)
+  createdAt      DateTime      @default(now())
+  processedAt    DateTime?
+}
+
+enum WebhookStatus {
+  RECEIVED
+  PROCESSING
+  PROCESSED
+  FAILED
+  IGNORED
+}
