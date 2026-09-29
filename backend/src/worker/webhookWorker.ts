@@ -2,6 +2,8 @@ import { Worker, Queue } from "bullmq";
 import IORedis from "ioredis";
 import { PrismaClient } from "@prisma/client";
 import axios from "axios";
+import { decrypt } from "../lib/crypto";
+import { fetchFacebookCustomerProfile } from "../lib/facebookProfile";
 
 const connection = new IORedis(
   process.env.REDIS_URL || "redis://localhost:6379",
@@ -10,12 +12,40 @@ const prisma = new PrismaClient();
 
 const webhookQueue = new Queue("webhook-events", { connection });
 
+
+
+
+async function emitConversationMessage(orgId: string | undefined, conversationId: string, message: any) {
+  try {
+    const internalSecret = process.env.INTERNAL_API_SECRET || "dev_secret";
+    await axios.post(
+      (process.env.API_URL || "http://localhost:4000") + "/api/internal/emit",
+      {
+        orgId,
+        type: "message",
+        payload: { conversationId, message },
+      },
+      { headers: { "x-internal-secret": internalSecret } },
+    );
+  } catch (err) {
+    const e: any = err;
+    console.error("internal emit failed", e?.message || String(e));
+  }
+}
+
 // Helper: normalize messaging events from Facebook webhook payload
 function extractMessagingEvents(raw: any) {
   const entries = raw.entry || [];
   const events: any[] = [];
   for (const e of entries) {
     const pageId = e.id;
+
+    if (e.messaging) {
+      for (const m of e.messaging) {
+        events.push({ pageId, ...m });
+      }
+    }
+
     for (const change of e.changes || []) {
       const value = change.value;
       if (value?.messaging) {
@@ -25,12 +55,6 @@ function extractMessagingEvents(raw: any) {
       }
       if (value?.messages) {
         for (const m of value.messages) {
-          events.push({ pageId, ...m });
-        }
-      }
-      // legacy: entry.messaging
-      if (e.messaging) {
-        for (const m of e.messaging) {
           events.push({ pageId, ...m });
         }
       }
@@ -76,13 +100,20 @@ const worker = new Worker(
             },
             include: { identities: true },
           });
+
+          const profile =
+            page && (!customer?.name || !customer?.avatar)
+              ? await fetchFacebookCustomerProfile(String(senderId), decrypt(page.accessToken))
+              : { name: null, avatar: null };
+
           if (!customer) {
             customer = await prisma.customer.create({
               data: {
                 organizationId: orgId,
                 channel: "facebook",
                 externalCustomerId: String(senderId),
-                name: null,
+                name: profile.name,
+                avatar: profile.avatar,
               },
             });
             await prisma.customerIdentity.create({
@@ -92,6 +123,15 @@ const worker = new Worker(
                 externalId: String(senderId),
                 metadata: item,
               },
+            });
+          } else if (profile.name || profile.avatar) {
+            customer = await prisma.customer.update({
+              where: { id: customer.id },
+              data: {
+                name: customer.name || profile.name,
+                avatar: customer.avatar || profile.avatar,
+              },
+              include: { identities: true },
             });
           }
         }
@@ -119,18 +159,44 @@ const worker = new Worker(
             });
           }
         }
+        if (conv && item.read?.watermark) {
+          const readAt = new Date(Number(item.read.watermark));
+          await prisma.message.updateMany({
+            where: {
+              conversationId: conv.id,
+              senderType: "AGENT",
+              createdAt: { lte: readAt },
+            },
+            data: { metadata: { readAt: readAt.toISOString() } },
+          });
+          await emitConversationMessage(orgId, conv.id, { type: "read", readAt });
+          continue;
+        }
+
+        if (conv && item.delivery?.mids?.length) {
+          await prisma.message.updateMany({
+            where: {
+              conversationId: conv.id,
+              externalMessageId: { in: item.delivery.mids.map(String) },
+            },
+            data: {
+              state: "SENT",
+              metadata: { deliveredAt: new Date(Number(item.delivery.watermark || Date.now())).toISOString() },
+            },
+          });
+          await emitConversationMessage(orgId, conv.id, { type: "delivery" });
+          continue;
+        }
+
         // create message
-        if (conv) {
+        if (conv && item.message) {
           const externalId =
             item.message?.mid ||
             item.message?.id ||
             item.mid ||
             item.message_id ||
             item.id;
-          const text =
-            item.message?.text ||
-            item.text ||
-            (item.message && item.message.text);
+          const text = item.message?.text || item.text;
           const message = await prisma.message.create({
             data: {
               organizationId: orgId || "",
@@ -139,36 +205,18 @@ const worker = new Worker(
               senderType: "CUSTOMER",
               messageType: "TEXT",
               text: text || null,
-              sentAt: new Date(),
+              sentAt: new Date(Number(item.timestamp || Date.now())),
             },
           });
-          // update conversation
           await prisma.conversation.update({
             where: { id: conv.id },
             data: {
-              lastMessage: message.text || "",
-              lastMessageAt: new Date(),
+              lastMessage: message.text || "Unsupported message",
+              lastMessageAt: new Date(Number(item.timestamp || Date.now())),
               unreadCount: { increment: 1 },
             },
           });
-          // notify main server via internal HTTP endpoint to emit realtime
-          try {
-            const internalSecret =
-              process.env.INTERNAL_API_SECRET || "dev_secret";
-            await axios.post(
-              (process.env.API_URL || "http://localhost:4000") +
-                "/api/internal/emit",
-              {
-                orgId,
-                type: "message",
-                payload: { conversationId: conv.id, message },
-              },
-              { headers: { "x-internal-secret": internalSecret } },
-            );
-          } catch (err) {
-            const e: any = err;
-            console.error("internal emit failed", e?.message || String(e));
-          }
+          await emitConversationMessage(orgId, conv.id, message);
         }
       }
 
@@ -189,7 +237,13 @@ const worker = new Worker(
 );
 
 export async function enqueueWebhookEvent(eventId: string, raw: any) {
-  const rec = await prisma.webhookEvent.create({ data: { eventId, raw } });
+  const rec = await prisma.webhookEvent.upsert({
+    where: { eventId },
+    update: { raw },
+    create: { eventId, raw },
+  });
+
+  if (rec.status === "PROCESSED" || rec.status === "PROCESSING") return;
   await webhookQueue.add("process", { webhookEventId: rec.id });
 }
 

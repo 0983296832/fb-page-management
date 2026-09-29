@@ -1,6 +1,6 @@
 import axios from "axios";
 
-const API_VERSION = process.env.META_API_VERSION || "v17.0";
+const API_VERSION = process.env.META_API_VERSION || "v26.0";
 
 export class MetaOAuthService {
   static getAuthUrl(redirectUri: string, scope: string[]) {

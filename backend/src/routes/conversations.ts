@@ -5,15 +5,62 @@ import { io } from "../main";
 const router = Router();
 const prisma = new PrismaClient();
 
+async function enrichConversation(conv: any) {
+  const [customer, page] = await Promise.all([
+    prisma.customer.findFirst({
+      where: {
+        organizationId: conv.organizationId,
+        channel: "facebook",
+        externalCustomerId: conv.channelConversationId,
+      },
+    }),
+    conv.pageId
+      ? prisma.facebookPage.findUnique({ where: { pageId: conv.pageId } })
+      : Promise.resolve(null),
+  ]);
+
+  return {
+    ...conv,
+    customer: customer
+      ? {
+          id: customer.id,
+          name: customer.name || `Facebook user ${customer.externalCustomerId}`,
+          avatar: customer.avatar,
+          externalCustomerId: customer.externalCustomerId,
+        }
+      : {
+          id: conv.channelConversationId,
+          name: `Facebook user ${conv.channelConversationId}`,
+          avatar: null,
+          externalCustomerId: conv.channelConversationId,
+        },
+    page: page
+      ? {
+          id: page.id,
+          pageId: page.pageId,
+          name: page.name,
+          avatar: page.avatar,
+          status: page.status,
+        }
+      : null,
+  };
+}
+
 router.get("/", async (req, res) => {
   const orgId = req.query.orgId as string;
+  const pageId = req.query.pageId as string | undefined;
   if (!orgId) return res.status(400).json({ error: "missing orgId" });
+
   const convs = await prisma.conversation.findMany({
-    where: { organizationId: orgId },
-    orderBy: { lastMessageAt: "desc" },
+    where: {
+      organizationId: orgId,
+      ...(pageId && pageId !== "all" ? { pageId } : {}),
+    },
+    orderBy: [{ lastMessageAt: "desc" }, { updatedAt: "desc" }],
     take: 50,
   });
-  res.json({ convs });
+
+  res.json({ convs: await Promise.all(convs.map(enrichConversation)) });
 });
 
 router.get("/:id", async (req, res) => {
@@ -23,13 +70,12 @@ router.get("/:id", async (req, res) => {
     include: { messages: { orderBy: { createdAt: "asc" } } },
   });
   if (!conv) return res.status(404).json({ error: "not found" });
-  res.json({ conv });
+  res.json({ conv: await enrichConversation(conv) });
 });
 
 router.post("/:id/messages", async (req, res) => {
   const id = req.params.id;
   const { text, senderId } = req.body;
-  // create message with SENDING state
   const msg = await prisma.message.create({
     data: {
       conversationId: id,
@@ -41,7 +87,7 @@ router.post("/:id/messages", async (req, res) => {
       state: "SENDING",
     },
   });
-  // emit realtime to org room
+
   const conv = await prisma.conversation.findUnique({ where: { id } });
   if (conv) {
     io.to(`org:${conv.organizationId}`).emit("message", {
@@ -50,8 +96,6 @@ router.post("/:id/messages", async (req, res) => {
     });
   }
 
-  // attempt to send to Meta and update state
-  // enqueue background send job
   try {
     const { enqueueSendMessage } = require("../worker/sendWorker");
     enqueueSendMessage(msg.id).catch((e: any) =>
